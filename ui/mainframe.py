@@ -28,6 +28,7 @@ import wx.adv
 from manager.devicemanager import DeviceManager
 from manager.windowmanager import WindowManager
 from manager.controlmanager import ControlManager, WebView
+from manager.fluttercontrolmanager import FlutterControlManager
 from utils import run_in_thread
 from utils.exceptions import ControlNotFoundError
 from utils.logger import Log
@@ -170,6 +171,8 @@ class MainFrame(wx.Frame):
         self.btn_getcontrol.Bind(wx.EVT_BUTTON, self.on_getcontrol_btn_click)
         self.btn_getcontrol.Enable(False)
 
+
+
         offset = 0
         if sys.platform == "darwin":
             offset = 10
@@ -228,6 +231,12 @@ class MainFrame(wx.Frame):
         )
         self.refresh_timer = wx.Timer(self)  # 创建定时器
         self.Bind(wx.EVT_TIMER, self.on_refresh_timer, self.refresh_timer)  # 绑定一个定时器事件
+
+        self.btn_getfluttercontrol = wx.Button(id=wx.ID_ANY, label=u"Flutter控件", name="btn_getfluttercontrol",
+                                               parent=box1, pos=wx.Point(860, 20 - offset), size=wx.DefaultSize, style=0,)
+
+        self.btn_getfluttercontrol.Bind(wx.EVT_BUTTON, self.on_getfluttercontrol_btn_click)
+        self.btn_getfluttercontrol.Enable(False)
 
         # ------------------------------- 中部区域 -----------------------------------
         self._main_height = default_size[1] - 310
@@ -416,6 +425,7 @@ class MainFrame(wx.Frame):
             sec = self.tc_refresh_interval.GetValue()
             self.refresh_timer.Start(int(float(sec) * 1000))
             self.btn_getcontrol.Enable(False)
+            self.btn_getfluttercontrol.Enable(False)
             self.rb_local_device.Enable(False)
             self.rb_remote_device.Enable(False)
             self.tc_dev_host.Enable(False)
@@ -424,6 +434,7 @@ class MainFrame(wx.Frame):
         else:
             self.refresh_timer.Stop()
             self.btn_getcontrol.Enable(True)
+            self.btn_getfluttercontrol.Enable(True)
             self.rb_local_device.Enable(True)
             self.rb_remote_device.Enable(True)
             self.tc_refresh_interval.Enable(True)
@@ -556,6 +567,7 @@ class MainFrame(wx.Frame):
             if self._device_host:
                 device_id = self._device_host + ":" + device_id
             self._device = DeviceDriver(ADB.open_device(device_id))
+            self._device.adb.start_logcat(clear=False)
             self.statusbar.SetStatusText(u"当前设备：%s" % self._select_device, 0)
             for tree in self._tree_list:
                 # 先删除之前创建的控件树
@@ -568,10 +580,12 @@ class MainFrame(wx.Frame):
             self.cb_activity.SetValue("")
             self._window_manager = WindowManager.get_instance(self._device)
             self._control_manager = ControlManager.get_instance(self._device)
+            self._flutter_control_manager = FlutterControlManager.get_instance(self._device)
             wx.CallLater(1000, lambda: self.on_getcontrol_btn_click(None))  # 自动获取控件树
 
         self.btn_refresh.Enable(True)
         self.btn_getcontrol.Enable(True)
+        self.btn_getfluttercontrol.Enable(True)
 
     def on_set_device_host_btn_click(self, event):
         """设置设备主机按钮点击回调"""
@@ -731,6 +745,67 @@ class MainFrame(wx.Frame):
         Log.i("MainFrame", "get control tree cost %s S%s" % (used_time, msg))
         self._show_control_tree(controls_dict)
 
+
+    @run_in_thread
+    def on_getfluttercontrol_btn_click(self, event):
+        """点击Flutter控件按钮"""
+        self.btn_getfluttercontrol.Enable(True)
+        if not self.cb_activity.GetValue():
+            # 先刷新窗口列表
+            self.on_refresh_btn_click(None)
+
+        if self.cb_activity.GetValue() == "Keyguard":
+            # 锁屏状态
+            dlg = wx.MessageDialog(
+                self,
+                u"设备：%s 处于锁屏状态，是否需要解锁？" % self.cb_device.GetValue(),
+                u"提示",
+                style=wx.YES_NO | wx.YES_DEFAULT | wx.ICON_QUESTION,
+            )
+            result = dlg.ShowModal()
+            if result == wx.ID_YES:
+                self._device.unlock_keyguard()
+                self.on_refresh_btn_click(None)
+            dlg.Destroy()
+
+        self.statusbar.SetStatusText(u"正在获取控件树……", 0)
+        time0 = time.time()
+        try:
+            flutter_tree = self._flutter_control_manager.get_control_tree(group_name="")
+            controls_dict = self._parser_flutter_control_tree(flutter_tree)
+            print('-------- flutter_control_tree', controls_dict)
+        except RuntimeError as e:
+            msg = e.args[0]
+            if not isinstance(msg, str):
+                msg = msg.decode("utf8")
+            dlg = wx.MessageDialog(self, msg, u"查找控件失败", style=wx.OK | wx.ICON_ERROR)
+            result = dlg.ShowModal()
+            dlg.Destroy()
+            return
+        t = threading.Thread(target=self._refresh_device_screenshot)
+        t.setDaemon(True)
+        t.start()
+
+        used_time = time.time() - time0
+        self.statusbar.SetStatusText(u"获取控件树完成，耗时：%s S" % used_time, 0)
+        msg = ""
+        for key in controls_dict:
+            msg += "\n%s: %d" % (key, len(controls_dict[key]) - 1)
+        Log.i("MainFrame", "get flutter control tree cost %s S%s" % (used_time, msg))
+        self._show__flutter_control_tree(controls_dict)
+
+    def _parser_flutter_control_tree(self, control_tree):
+        """解析flutter控件树"""
+        res = {}
+        key_list = ['description', 'objectId', 'valueId', 'widgetRuntimeType']
+        for key, value in control_tree.items():
+            if key in key_list:
+                res[key] = value
+            elif key == 'children':
+                res.update({"children": [self._parser_flutter_control_tree(item) if item else {} for item in value]})
+        return res
+
+
     @run_in_main_thread
     def _show_control_tree(self, controls_dict):
         """显示控件树"""
@@ -741,6 +816,11 @@ class MainFrame(wx.Frame):
         self.tree.SelectItem(self.root)
         self.tree.SetFocus()
         self.btn_getcontrol.Enable(True)
+
+    @run_in_main_thread
+    def _show__flutter_control_tree(self, controls_dict):
+        """显示flutter控件树"""
+        pass
 
     def on_local_device_selected(self, event):
         """选择本地设备"""
